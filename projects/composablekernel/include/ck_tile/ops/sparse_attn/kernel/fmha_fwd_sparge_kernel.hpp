@@ -526,21 +526,6 @@ struct FmhaFwdSpargeMaskPredictionKernel
         return static_cast<std::size_t>(Pipeline::GetSmemSize(hdim, num_k_blocks));
     }
 
-    CK_TILE_DEVICE static index_t
-    block_to_batch(const int32_t* seqstart_block_ptr, index_t batch, index_t g_block)
-    {
-        index_t lo = 0;
-        index_t hi = batch;
-        while(lo + 1 < hi)
-        {
-            const index_t mid = (lo + hi) / 2;
-            if(g_block < seqstart_block_ptr[mid])
-                hi = mid;
-            else
-                lo = mid;
-        }
-        return __builtin_amdgcn_readfirstlane(lo);
-    }
 
     CK_TILE_DEVICE void operator()(SpargeMaskPredictionKargs kargs) const
     {
@@ -552,7 +537,7 @@ struct FmhaFwdSpargeMaskPredictionKernel
             const index_t g_q_block = __builtin_amdgcn_readfirstlane(gid % kargs.total_q_blocks);
             const index_t head      = __builtin_amdgcn_readfirstlane(gid / kargs.total_q_blocks);
             const index_t kv_head   = __builtin_amdgcn_readfirstlane(head / kargs.nhead_ratio_qk);
-            const index_t b         = block_to_batch(
+            const index_t b         = sparge_block_to_batch(
                 kargs.seqstart_q_block_ptr, kargs.batch, g_q_block);
             const index_t qstart_b   = __builtin_amdgcn_readfirstlane(
                 kargs.seqstart_q_block_ptr[b]);

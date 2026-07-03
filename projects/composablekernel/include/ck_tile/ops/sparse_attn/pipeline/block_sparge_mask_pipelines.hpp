@@ -411,15 +411,25 @@ struct BlockSpargePreprocessPipeline
         block_sync_lds();
 
         // group absmax over tokens_per_scale consecutive tokens -> scale = absmax/divisor.
+        // num_scale = kBlock/tps is <= kBlock/4 = 32 < kBlockSize, so each low tid owns one group.
         const index_t num_scale = kBlock / tps;
-        for(index_t g = tid; g < num_scale; g += kBlockSize)
+        assert(num_scale <= kBlockSize && "one group per thread assumed for scale staging");
+        float my_scale = 0.0f;
+        if(tid < num_scale)
         {
+            const index_t g0 = tid * tps;
             float a = 0.0f;
-            const index_t g0 = g * tps;
             for(index_t t = 0; t < tps; ++t)
                 a = max(a, s_absmax[g0 + t]);
-            params.scale_out[g] = a / kQuantDivisor;
+            my_scale = a / kQuantDivisor;
+            params.scale_out[tid] = my_scale; // global output (per-block scales)
         }
+        // Stage the group scales back into LDS so the quant sweep reads them locally instead of
+        // re-reading global scale_out (a cross-thread global round-trip that block_sync_lds does not
+        // fence). Barrier first so every group has finished reading s_absmax before we overwrite it.
+        block_sync_lds();
+        if(tid < num_scale)
+            s_absmax[tid] = my_scale;
         block_sync_lds();
 
         // sweep tile -> quant = round(val / scale[token-group]). OOB tokens skipped.
@@ -449,7 +459,7 @@ struct BlockSpargePreprocessPipeline
             if(t < count)
             {
                 const index_t c = tile_idx.at(number<1>{}); // hidden channel (N)
-                const float sc  = params.scale_out[t / tps];
+                const float sc  = s_absmax[t / tps]; // group scale staged in LDS above
                 float v         = type_convert<ComputeDataType>(q_tile[idx]);
                 if(has_km)
                     v -= s_km[c];
@@ -1074,7 +1084,17 @@ struct BlockSpargeMaskPredictionPipeline
         const index_t tid = get_thread_id();
 
         assert(hdim == kHdim && "sparge mask tile score path requires hdim == 128");
-        assert(num_k_blocks <= kMaxKBlocksPow2 && "num_k_blocks exceeds sort capacity");
+
+        // Hard runtime guard (survives release, where assert is stripped): the sort/scan buffers are
+        // sized to kMaxKBlocksPow2, so num_k_blocks beyond it would silently overrun LDS. The host
+        // dispatch already picks the smallest capacity variant >= num_k_blocks, so this only trips if
+        // a caller bypasses that path; emit an empty LUT and bail instead of corrupting memory.
+        if(num_k_blocks > kMaxKBlocksPow2)
+        {
+            if(tid == 0)
+                *vbn_ptr = 0;
+            return;
+        }
 
         float* q_mean_smem = reinterpret_cast<float*>(smem);
         float* scores_smem = q_mean_smem + hdim;
@@ -1193,25 +1213,30 @@ struct BlockSpargeMaskPredictionPipeline
             block_sync_lds();
         }
 
-        // Softmax; normalize only for CDF mode (TopK is scaling-invariant).
-        float local_max = -INFINITY;
-        for(index_t k = tid; k < num_k_blocks; k += kBlockSize)
-            local_max = (scores_smem[k] > local_max) ? scores_smem[k] : local_max;
-        const float max_score = block_reduce_max_f32<kBlockSize>(local_max, scratch_f32, tid);
-
-        float local_sum = 0.0f;
-        for(index_t k = tid; k < num_k_blocks; k += kBlockSize)
-        {
-            float p = ck_tile::exp(scores_smem[k] - max_score);
-            scores_smem[k] = p;
-            local_sum += p;
-        }
-        const float sum_exp = block_reduce_sum_f32<kBlockSize>(local_sum, scratch_f32, tid);
-
         const bool topk_mode = (head_topk > 0.0f);
+        // Softmax is only needed by the CDF path; TopK sorts the raw scores directly (exp is
+        // monotonic, so it does not change the descending order or the selected set). Skipping it
+        // for TopK saves the exp pass plus a CTA-wide sum reduction.
         // CDF runs on the unnormalized exp scores (each in (0,1] after the max-shift): rather than
         // dividing every score by sum_exp (an extra LDS pass + sync), searchsorted below compares the
-        // unnormalized cumsum against head_cdfthreshd * sum_exp. TopK is scale-invariant either way.
+        // unnormalized cumsum against head_cdfthreshd * sum_exp.
+        float sum_exp = 0.0f;
+        if(!topk_mode)
+        {
+            float local_max = -INFINITY;
+            for(index_t k = tid; k < num_k_blocks; k += kBlockSize)
+                local_max = (scores_smem[k] > local_max) ? scores_smem[k] : local_max;
+            const float max_score = block_reduce_max_f32<kBlockSize>(local_max, scratch_f32, tid);
+
+            float local_sum = 0.0f;
+            for(index_t k = tid; k < num_k_blocks; k += kBlockSize)
+            {
+                float p = ck_tile::exp(scores_smem[k] - max_score);
+                scores_smem[k] = p;
+                local_sum += p;
+            }
+            sum_exp = block_reduce_sum_f32<kBlockSize>(local_sum, scratch_f32, tid);
+        }
 
         // Dispatch sort+select to smallest pow-of-2 >= num_k_blocks.
         int32_t n_target = 0;
