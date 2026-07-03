@@ -9,6 +9,7 @@
 #include "ck_tile/ops/common/generic_2d_block_shape.hpp"
 #include "ck_tile/ops/topk.hpp"
 #include "ck_tile/ops/sageattention/block/block_sageattention_quant_scale_enum.hpp"
+#include "ck_tile/ops/sageattention/pipeline/tile_sageattn_traits.hpp"
 
 #include <cassert>
 
@@ -160,6 +161,15 @@ CK_TILE_HOST_DEVICE constexpr float sparge_quant_absmax_divisor()
 // Per-block mean + optional cosine similarity (+ optional row-wise quant). Tile-programmed:
 // reduces along the token axis with BlockReduce2d; matches the CPU reference bit-for-bit.
 // Requires hdim == block_size == 128 (runtime-asserted).
+//
+// QScale selects the row-wise quant granularity, one launch shared by the Q and K sides:
+//   * NO_SCALE                    -> means/sim only, no quant (kDoQuant == false).
+//   * PERWARP / BLOCKSCALE / PERTHREAD -> grouped row-wise quant. The group size differs per side
+//     (Q vs K) and is the single source of truth TileSageAttnTraits::kBlockScaleSize{Q,K}; because
+//     one compiled instance serves both sides it cannot be a single compile-time constant here, so
+//     it arrives as the runtime Params::tokens_per_scale and is asserted against the traits below.
+//   * PERTENSOR is NOT handled here -- it is a single per-(b,h) global scale produced by the
+//     separate BlockSpargeQKQuantPipeline; the codegen maps PERTENSOR to NO_SCALE for this pipeline.
 template <typename InputType_,
           index_t kBlockSize_                            = 256,
           BlockSageAttentionQuantScaleEnum QScale        = BlockSageAttentionQuantScaleEnum::NO_SCALE,
@@ -172,6 +182,16 @@ struct BlockSpargePreprocessPipeline
 
     static constexpr bool kDoQuant =
         (QScale != BlockSageAttentionQuantScaleEnum::NO_SCALE);
+
+    static_assert(QScale != BlockSageAttentionQuantScaleEnum::PERTENSOR,
+                  "PERTENSOR quant is handled by BlockSpargeQKQuantPipeline, not here; codegen maps "
+                  "PERTENSOR to NO_SCALE for the preprocess pipeline");
+
+    // tokens-per-scale truth source shared with sageattn (see class comment). Q/K differ, so both
+    // legal values are exposed and Params::tokens_per_scale is runtime-checked against them.
+    using QuantTraits = TileSageAttnTraits<false, false, false, false, QScale>;
+    static constexpr index_t kBlockScaleSizeQ = QuantTraits::kBlockScaleSizeQ;
+    static constexpr index_t kBlockScaleSizeK = QuantTraits::kBlockScaleSizeK;
 
     static constexpr index_t kBlockSize   = kBlockSize_;
     static constexpr index_t kHdim        = 128;
@@ -225,6 +245,30 @@ struct BlockSpargePreprocessPipeline
                 sequence<0, 3, 0, 3>>{});
     }
 
+    // Load-optimized distribution for staging the [token(M), hidden(N)] block from global -> LDS.
+    // The reduce distribution above keeps a whole token-row's channels inside one warp (needed for
+    // the mean/sim reduce along the token axis), which forces a tiny vector width along the
+    // contiguous hidden axis (Vector_N = 2 -> 4B loads). Staging is a plain coalesced copy with no
+    // reduce, so it uses its own distribution with a wide hidden vector (Vector_N = 8 -> 16B/128-bit
+    // loads). LDS holds the block row-major [token, hidden], so element (t,h) lands in the same
+    // physical slot regardless of which distribution wrote it; the reduce passes re-read from LDS
+    // through the reduce distribution unchanged, so this is a pure load-bandwidth change.
+    //   M = token : Repeat 8, Warp 4, Thread 4,  Vector 1  -> 128
+    //   N = hidden: Repeat 1, Warp 1, Thread 16, Vector 8  -> 128
+    //   threads = Warp_M*Warp_N*Thread_M*Thread_N = 4*1*4*16 = 256 = kBlockSize
+    CK_TILE_DEVICE static constexpr auto MakeLoadBlockTileDistribution()
+    {
+        return make_static_tile_distribution(
+            tile_distribution_encoding<
+                sequence<>,
+                tuple<sequence<8, 4, 4, 1>,   // M = token
+                      sequence<1, 1, 16, 8>>, // N = hidden
+                tuple<sequence<1, 2>, sequence<1, 2>>,
+                tuple<sequence<1, 1>, sequence<2, 2>>,
+                sequence<1, 1, 2, 2>,
+                sequence<0, 3, 0, 3>>{});
+    }
+
     struct Params
     {
         index_t seqlen;
@@ -238,7 +282,9 @@ struct BlockSpargePreprocessPipeline
         // Quantization (QScale != NO_SCALE); unused on the NO_SCALE path.
         QuantType* quant_out;      // [block_size, hdim] quant out (token-major, hdim stride 1)
         float*  scale_out;         // [block_size / tokens_per_scale] scales for this block
-        index_t tokens_per_scale;  // PERWARP: Q=32, K=64 (kBlockScaleSize)
+        // Group size along tokens; must equal kBlockScaleSizeQ (Q side) or kBlockScaleSizeK (K side)
+        // for this QScale -- asserted in quantize_block. PERWARP: Q=32, K=64.
+        index_t tokens_per_scale;
         index_t quant_stride_seq;  // token stride of quant_out in elements
     };
 
@@ -290,11 +336,11 @@ struct BlockSpargePreprocessPipeline
             make_tuple(sequence<0>{}, sequence<1>{}));
     }
 
-    // Per-warp row-wise quant: per-token absmax over hidden, grouped over tokens_per_scale tokens
-    // -> scale = absmax/divisor, then quant = round(val / scale). smooth_k (K side, km_ptr != null):
-    // the centered value (val - km[channel]) feeds BOTH absmax and quant, matching official
-    // SpargeAttn; km is staged in s_km (indexed by hidden channel). Q side passes km_ptr == nullptr.
-    // s_absmax is a [kBlock] LDS scratch (one slot per token-within-block).
+    // Row-wise quant at the QScale granularity: per-token absmax over hidden, grouped over
+    // tokens_per_scale tokens -> scale = absmax/divisor, then quant = round(val / scale). smooth_k
+    // (K side, km_ptr != null): the centered value (val - km[channel]) feeds BOTH absmax and quant,
+    // matching official SpargeAttn; km is staged in s_km (indexed by hidden channel). Q side passes
+    // km_ptr == nullptr. s_absmax is a [kBlock] LDS scratch (one slot per token-within-block).
     CK_TILE_DEVICE void quantize_block(InputType*        p_stage,
                                        const Params&     params,
                                        index_t           count,
@@ -306,6 +352,11 @@ struct BlockSpargePreprocessPipeline
         const index_t tid     = get_thread_id();
         const index_t tps     = params.tokens_per_scale;
         const bool    has_km  = (params.km_ptr != nullptr);
+
+        // Bind the runtime group size to the compile-time truth source (one instance serves both
+        // sides, so tps is Q's or K's traits value). Mirrors sageattn's MakeKargs check.
+        assert((tps == kBlockScaleSizeQ || tps == kBlockScaleSizeK) &&
+               "tokens_per_scale must match TileSageAttnTraits::kBlockScaleSize{Q,K} for this QScale");
 
         const auto stage_tn = MakeStageViewTN(p_stage);
         auto q_window = make_tile_window(
@@ -321,17 +372,24 @@ struct BlockSpargePreprocessPipeline
 
         auto q_tile = load_tile(q_window);
 
-        // per-token absmax over hidden (N); smooth_k centers by km[c] first. OOB tokens reduce to 0.
+        // per-token absmax over hidden (N); smooth_k centers by km[c] first. OOB tokens (t >= count)
+        // are zeroed at the source so their reduced absmax is exactly 0 (matches the pre-zeroed LDS
+        // slots of the manual-scatter path this store_tile replaces).
         auto abs_tile = make_static_distributed_tensor<ComputeDataType>(
             decltype(q_tile)::get_tile_distribution());
         sweep_tile(q_tile, [&](auto idx) {
-            float v = type_convert<ComputeDataType>(q_tile[idx]);
-            if(has_km)
+            const auto tile_idx = get_x_indices_from_distributed_indices(
+                q_tile.get_tile_distribution(), idx);
+            const index_t t = tile_idx.at(number<0>{}); // token-within-block (M)
+            float v         = 0.0f;
+            if(t < count)
             {
-                const auto tile_idx = get_x_indices_from_distributed_indices(
-                    q_tile.get_tile_distribution(), idx);
-                const index_t c = tile_idx.at(number<1>{});
-                v -= s_km[c];
+                v = type_convert<ComputeDataType>(q_tile[idx]);
+                if(has_km)
+                {
+                    const index_t c = tile_idx.at(number<1>{});
+                    v -= s_km[c];
+                }
             }
             abs_tile(idx) = v;
         });
@@ -341,18 +399,15 @@ struct BlockSpargePreprocessPipeline
         if constexpr(kNeedCrossWarpSync)
             reduce_xwarp(amax_tile, s_reduce, absmax_func);
 
-        // stage per-token absmax in LDS.
-        for(index_t t = tid; t < kBlock; t += kBlockSize)
-            s_absmax[t] = 0.0f;
-        block_sync_lds();
-        sweep_tile_span(decltype(amax_tile)::get_distributed_spans()[number<0>{}], [&](auto idx0) {
-            constexpr auto t_idx = make_tuple(idx0);
-            const auto tile_idx  = get_x_indices_from_distributed_indices(
-                amax_tile.get_tile_distribution(), t_idx);
-            const index_t t = tile_idx.at(number<0>{});
-            if(t < count)
-                s_absmax[t] = amax_tile[t_idx];
-        });
+        // stage per-token absmax in LDS. store_tile maps the reduced per-token tile straight into the
+        // [kBlock] LDS scratch via the tile distribution (no manual index conversion).
+        auto absmax_view = make_tensor_view<address_space_enum::lds>(
+            s_absmax,
+            make_naive_tensor_descriptor(
+                make_tuple(number<kBlock>{}), make_tuple(number<1>{})));
+        auto absmax_window = make_tile_window(
+            absmax_view, make_tuple(number<kBlock>{}), {0});
+        store_tile(absmax_window, amax_tile);
         block_sync_lds();
 
         // group absmax over tokens_per_scale consecutive tokens -> scale = absmax/divisor.
@@ -458,14 +513,14 @@ struct BlockSpargePreprocessPipeline
                 padded_in,
                 make_tuple(number<kBlock>{}, number<kHdim>{}),
                 {s_start, 0},
-                MakeXBlockTileDistribution());
+                MakeLoadBlockTileDistribution());
 
             auto stage_view = MakeStageViewTN(s_stage);
             auto stage_window = make_tile_window(
                 stage_view,
                 make_tuple(number<kBlock>{}, number<kHdim>{}),
                 {0, 0},
-                MakeXBlockTileDistribution());
+                MakeLoadBlockTileDistribution());
 
             auto in_tile = load_tile(in_window);
             store_tile(stage_window, in_tile);
@@ -526,16 +581,19 @@ struct BlockSpargePreprocessPipeline
             reduce_xwarp(mean_tile, s_reduce, add_func);
 
         const float inv_count = 1.0f / static_cast<float>(count);
-        // Write per-channel mean; mean_tile is replicated across the threads that reduced each m,
-        // so duplicate stores carry identical values.
-        constexpr auto mean_spans = decltype(mean_tile)::get_distributed_spans();
-        sweep_tile_span(mean_spans[number<0>{}], [&](auto idx0) {
-            constexpr auto m_idx = make_tuple(idx0);
-            const auto tile_idx  = get_x_indices_from_distributed_indices(
-                mean_tile.get_tile_distribution(), m_idx);
-            const index_t m = tile_idx.at(number<0>{});
-            mean_out[m]     = mean_tile[m_idx] * inv_count;
-        });
+        // Write per-channel mean via store_tile: normalize the reduced per-channel tile then map it
+        // straight into the [kHdim] output through the tile distribution (no manual index scatter;
+        // the tile-window store also collapses the cross-thread duplicate writes).
+        auto mean_normalized = tile_elementwise_in(
+            [inv_count](auto x) { return x * inv_count; }, mean_tile);
+        auto mean_view = make_naive_tensor_view<address_space_enum::global>(
+            mean_out,
+            make_tuple(number<kHdim>{}),
+            make_tuple(number<1>{}),
+            number<1>{},
+            number<1>{});
+        auto mean_window = make_tile_window(mean_view, make_tuple(number<kHdim>{}), {0});
+        store_tile(mean_window, mean_normalized);
 
         if(!(sim_out != nullptr && params.simthreshold > 0.0f))
         {
