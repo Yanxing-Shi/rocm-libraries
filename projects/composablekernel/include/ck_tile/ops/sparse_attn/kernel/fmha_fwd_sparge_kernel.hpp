@@ -250,7 +250,12 @@ struct FmhaFwdSpargePreprocessOneSideKernel
             }
         }
 
-        Pipeline{}(slice, mean_out, sim_out, pp, smem_raw);
+        // Dispatch the WG-uniform smooth_k flag to a compile-time branch so the pipeline can drop the
+        // km load/subtract entirely on the Q side (and K side with smooth_k off).
+        if(pp.km_ptr != nullptr)
+            Pipeline{}(slice, mean_out, sim_out, pp, smem_raw, bool_constant<true>{});
+        else
+            Pipeline{}(slice, mean_out, sim_out, pp, smem_raw, bool_constant<false>{});
     }
 };
 
@@ -452,7 +457,11 @@ struct FmhaFwdSpargeQKQuantKernel
                       static_cast<long_index_t>(kargs.hdim)
             : nullptr;
 
-        Pipeline{}(slice, quant_out, scale_out, pp, smem_raw);
+        // Compile-time smooth_k branch so the km load/subtract is dropped on the Q side.
+        if(pp.km_ptr != nullptr)
+            Pipeline{}(slice, quant_out, scale_out, pp, smem_raw, bool_constant<true>{});
+        else
+            Pipeline{}(slice, quant_out, scale_out, pp, smem_raw, bool_constant<false>{});
     }
 };
 
