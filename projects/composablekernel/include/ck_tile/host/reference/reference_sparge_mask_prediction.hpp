@@ -458,6 +458,12 @@ reference_sparge_mask_prediction(const HostTensor<T>& q_bhsd,
                     for(index_t kj = 0; kj < num_k_blocks; ++kj)
                         mask(b, h, qi, kj) =
                             (kj >= causal_min_kj && kj <= causal_max_kj) ? 1 : 0;
+                    // Attention sink still applies on this early-out path: the device runs the sink
+                    // (force block 0, no causal check) AFTER the Q-sim union, so a low-sim Q block
+                    // must also keep block 0. Without this the device/reference selections diverge
+                    // under a sliding window where block 0 is outside the causal range.
+                    if(attention_sink && num_k_blocks > 0)
+                        mask(b, h, qi, 0) = 1;
                     continue;
                 }
 
